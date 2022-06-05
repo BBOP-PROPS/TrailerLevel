@@ -5,7 +5,7 @@
 // PURPOSE: minimal demo
 //    DATE: 2021-03-28
 
-#define SERIAL_OUTPUT // used for debugging
+//#define SERIAL_OUTPUT // used for debugging
 
 #include "RH_ASK.h" // Radio Head Amplitude Shift Key
 #include <Wire.h>
@@ -96,7 +96,7 @@ void displayFloat(uint8_t row, uint8_t col, float x)
 
 void loop()
 {
-  static bool noSignal = true;
+  static bool noSignal = false;
   LevelData_t dataReceived;
   static unsigned long lastReceivedTime = 0;
   uint8_t buflen = sizeof(dataReceived);
@@ -131,7 +131,7 @@ void loop()
   }
   else
   {
-    if ((millis() - lastReceivedTime) > 3000)
+    if (((millis() - lastReceivedTime) > 3000) && !noSignal)
     {
 #ifdef SERIAL_OUTPUT
       Serial.println((millis() - lastReceivedTime));
