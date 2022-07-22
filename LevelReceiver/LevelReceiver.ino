@@ -7,7 +7,6 @@
 
 //#define SERIAL_OUTPUT // used for debugging
 
-#include "RH_ASK.h" // Radio Head Amplitude Shift Key
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <Math.h>
@@ -18,12 +17,35 @@
 #define printByte(args)  print(args,BYTE);
 #endif
 
-RH_ASK receiver;
-
-//#define DEBUG_COUNTER
-#ifdef DEBUG_COUNTER
-float debugCounter = 0.0f;
+#include <Arduino.h>
+#include <cc1101.h>
+#include <ccpacket.h>
+// Attach CC1101 pins to their corresponding SPI pins
+// Uno pins:
+// CSN (SS) => 10
+// MOSI => 11
+// MISO => 12
+// SCK => 13
+// GD0 => A valid interrupt pin for your platform (defined below this)
+#if defined(__AVR_ATmega2560__) || defined(__AVR_ATmega1280__)
+#define CC1101Interrupt 4 // Pin 19
+#define CC1101_GDO0 19
+#elif defined(__MK64FX512__)
+// Teensy 3.5
+#define CC1101Interrupt 9 // Pin 9
+#define CC1101_GDO0 9
+#else
+#define CC1101Interrupt 0 // Pin 2
+#define CC1101_GDO0 2
 #endif
+#define CC1101_DEFVAL_MDMCFG4_1200    0xC5   // Modem configuration. Speed = 1200 bps
+
+CC1101 radio;
+byte syncWord[2] = {199, 10};
+bool packetWaiting;
+void messageReceived() {
+  packetWaiting = true;
+}
 
 struct LevelData_t
 {
@@ -33,7 +55,7 @@ struct LevelData_t
   float temperature = 0.0f;
 };
 
-LiquidCrystal_I2C lcd(0x27,20,4);  // set the LCD address to 0x27 for a 20 chars and 4 line display
+LiquidCrystal_I2C lcd(0x27, 20, 4); // set the LCD address to 0x27 for a 20 chars and 4 line display
 
 void SplashScreen()
 {
@@ -69,17 +91,20 @@ void SplashScreen()
 
 void setup()
 {
+#ifdef SERIAL_OUTPUT
   Serial.begin(115200);
   Serial.println(__FILE__);
+#endif
+  radio.init();
+  radio.setSyncWord(syncWord);
+  radio.setCarrierFreq(CFREQ_433);
+  radio.disableAddressCheck();
+  radio.setTxPowerAmp(PA_LongDistance);
+  radio.writeReg(CC1101_MDMCFG4, CC1101_DEFVAL_MDMCFG4_1200); // Set the bit rate to 1200 for better receiver sensitivity
+  attachInterrupt(CC1101Interrupt, messageReceived, FALLING);
 
-  delay(500); // Let power settle before initializing
-  
-  lcd.init();                      // initialize the lcd 
+  lcd.init();                      // initialize the lcd
   lcd.backlight();
-
-  if (!receiver.init())
-    Serial.println("init failed");
-
   SplashScreen();
   delay(5000);
 }
@@ -94,6 +119,24 @@ void displayFloat(uint8_t row, uint8_t col, float x)
   lcd.print(xstr);
 }
 
+// Get signal strength indicator in dBm.
+// See: http://www.ti.com/lit/an/swra114d/swra114d.pdf
+int rssi(char raw) {
+  uint8_t rssi_dec;
+  // TODO: This rssi_offset is dependent on baud and MHz; this is for 38.4kbps and 433 MHz.
+  uint8_t rssi_offset = 74;
+  rssi_dec = (uint8_t) raw;
+  if (rssi_dec >= 128)
+    return ((int)( rssi_dec - 256) / 2) - rssi_offset;
+  else
+    return (rssi_dec / 2) - rssi_offset;
+}
+
+// Get link quality indicator.
+int lqi(char raw) {
+  return 0x3F - raw;
+}
+
 void loop()
 {
   static bool noSignal = false;
@@ -101,33 +144,60 @@ void loop()
   static unsigned long lastReceivedTime = 0;
   uint8_t buflen = sizeof(dataReceived);
 
-  if (receiver.recv((uint8_t*)&dataReceived, &buflen))
+  if (packetWaiting)
   {
-    lastReceivedTime = millis();
-    lcd.setCursor(0, 2);
-    lcd.print("Angle");
-    if (noSignal)
+    detachInterrupt(CC1101Interrupt);
+    packetWaiting = false;
+    CCPACKET packet;
+    if (radio.receiveData(&packet) > 0)
     {
-      noSignal = false;
-      lcd.setCursor(0, 3);
-      lcd.print("                    ");
-    }
-    displayFloat(0, 3, dataReceived.angleX);
+      if (packet.crc_ok)
+      {
+        memcpy((char*)&dataReceived, (char*)&packet.data, max(packet.length, sizeof(dataReceived)));
+        lastReceivedTime = millis();
+        lcd.setCursor(0, 2);
+        lcd.print("Angle");
+        if (noSignal)
+        {
+          noSignal = false;
+          lcd.setCursor(0, 3);
+          lcd.print("                    ");
+        }
+        displayFloat(0, 3, dataReceived.angleX);
 #ifdef SERIAL_OUTPUT
-    Serial.println(dataReceived.angleX);
+        Serial.println(dataReceived.angleX);
 #endif
-    float angleRadians = dataReceived.angleX * 2.0 * PI / 360.0;
-    float adjustment = 102 * sin(angleRadians);
-    lcd.setCursor(15, 2);
-    if (adjustment > 0)
-      lcd.print("Left ");
-    else
-      lcd.print("Right");
-    displayFloat(15, 3, fabsf(adjustment));
-#ifdef DEBUG_COUNTER
-    debugCounter += 1.0f;
-    displayFloat(15, 2, debugCounter);
+        float angleRadians = dataReceived.angleX * 2.0 * PI / 360.0;
+        float adjustment = 102 * sin(angleRadians);
+        lcd.setCursor(15, 2);
+        if (adjustment > 0)
+          lcd.print("Left ");
+        else
+          lcd.print("Right");
+        displayFloat(15, 3, fabsf(adjustment));
+      }
+#ifdef SERIAL_OUTPUT
+      Serial.println(F("Received packet..."));
+      if (!packet.crc_ok)
+      {
+        Serial.println(F("crc not ok"));
+      }
+      Serial.print(F("lqi: "));
+      Serial.println(lqi(packet.lqi));
+      Serial.print(F("rssi: "));
+      Serial.print(rssi(packet.rssi));
+      Serial.println(F("dBm"));
+
+      if (packet.crc_ok && packet.length > 0)
+      {
+        Serial.print(F("packet: len "));
+        Serial.println(packet.length);
+        Serial.println(F("data: "));
+        Serial.println((const char *) packet.data);
+      }
 #endif
+    }
+    attachInterrupt(CC1101Interrupt, messageReceived, FALLING);
   }
   else
   {

@@ -1,0 +1,9 @@
+This pinout is for the CC1101 module on a blue board with black 8-pin connector and short spring antenna.
+
+1.GND  2.VCC
+
+3.GDO0 4.CSN
+
+5.SCLK 6.MOSI
+
+7.MISO 8.GDO2
